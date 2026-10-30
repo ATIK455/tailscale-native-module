@@ -1,0 +1,13 @@
+# Build artifacts
+dist/
+ts_src/
+bin/
+*.bak
+*.log
+*.sock
+*.pid
+*.state
+
+# OS files
+.DS_Store
+Thumbs.db
