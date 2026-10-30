@@ -1,0 +1,182 @@
+name: Build Official Tailscale ARM64 & Module
+
+on:
+  workflow_dispatch:
+    inputs:
+      tailscale_tag:
+        description: 'Official Tailscale tag (e.g. v1.104.4 - leave blank to auto-detect latest release)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 6 * * 1' # Check every Monday morning at 6 AM UTC
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Module Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+
+      - name: Resolve Upstream Tailscale Tag
+        id: resolve-tag
+        run: |
+          INPUT_TAG="${{ github.event.inputs.tailscale_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            echo "Auto-detecting latest official Tailscale release..."
+            TAG=$(curl -s https://api.github.com/repos/tailscale/tailscale/releases/latest | grep '"tag_name":' | head -n 1 | cut -d '"' -f 4)
+            if [ -z "$TAG" ]; then
+              TAG="v1.104.4"
+            fi
+          fi
+          echo "Resolved Tag: $TAG"
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          
+          # Clean version code (e.g. v1.104.4 -> 11044)
+          VER_CODE=$(echo "$TAG" | tr -cd '0-9')
+          echo "VER_CODE=$VER_CODE" >> $GITHUB_OUTPUT
+
+      - name: Clone Official Tailscale
+        run: |
+          TAG="${{ steps.resolve-tag.outputs.TAG }}"
+          echo "Cloning official Tailscale ($TAG)..."
+          git clone --depth 1 --branch "$TAG" https://github.com/tailscale/tailscale.git ts_src
+
+      - name: Apply Native Android TUN Patch
+        run: |
+          cd ts_src
+          echo "Applying native Android TUN & fwmark patch..."
+          git apply ../patches/tailscale-android-native.patch
+
+      - name: Compile Native Android ARM64 Binaries
+        run: |
+          cd ts_src
+          mkdir -p ../dist/arm64
+          export CGO_ENABLED=0
+          export GOOS=android
+          export GOARCH=arm64
+          
+          echo "Building tailscale CLI..."
+          go build -tags=ts_omit_systray -trimpath -ldflags="-s -w" -o ../dist/arm64/tailscale tailscale.com/cmd/tailscale
+          
+          echo "Building tailscaled daemon..."
+          go build -tags=ts_omit_systray -trimpath -ldflags="-s -w" -o ../dist/arm64/tailscaled tailscale.com/cmd/tailscaled
+          
+          # Upstream commit marker & SHA256 checksums
+          git rev-parse HEAD > ../dist/commit
+          cd ../dist
+          sha256sum arm64/tailscale arm64/tailscaled > last-update.sha256
+          chmod 0755 arm64/tailscale arm64/tailscaled
+
+      - name: Verify Compiled Binaries
+        run: |
+          file dist/arm64/tailscale
+          file dist/arm64/tailscaled
+          ls -la dist/arm64/
+
+      - name: Package Magisk / KernelSU Flashable Module ZIP
+        run: |
+          TAG="${{ steps.resolve-tag.outputs.TAG }}"
+          VER_CODE="${{ steps.resolve-tag.outputs.VER_CODE }}"
+          
+          # Synchronize module.prop version
+          sed -i "s/^version=.*/version=$TAG/" module.prop
+          sed -i "s/^versionCode=.*/versionCode=$VER_CODE/" module.prop
+          
+          # Create standalone zip module (binaries are downloaded on install)
+          zip -r dist/tailscale-native.zip \
+            module.prop \
+            service.sh \
+            action.sh \
+            customize.sh \
+            common.sh \
+            uninstall.sh
+            
+          cp dist/tailscale-native.zip "dist/tailscale-native-${TAG}.zip"
+          ls -lh dist/*.zip
+
+      - name: Update changelog.md, update.json and module.prop on main
+        run: |
+          TAG="${{ steps.resolve-tag.outputs.TAG }}"
+          VER_CODE="${{ steps.resolve-tag.outputs.VER_CODE }}"
+          DATE=$(date -u +"%Y-%m-%d")
+          
+          # Fetch official release notes from upstream
+          UPSTREAM_BODY=$(curl -s "https://api.github.com/repos/tailscale/tailscale/releases/tags/$TAG" | jq -r '.body // empty')
+          
+          # Check if this release is already documented in changelog.md
+          if ! grep -Fq "## $TAG" changelog.md 2>/dev/null; then
+            echo "Prepending $TAG to changelog.md..."
+            TEMP_CHANGELOG=$(mktemp)
+            printf "# Native Tailscale TUN Module Changelog\n\n## %s (%s)\n- Upstream engine updated to official Tailscale [%s](https://github.com/tailscale/tailscale/releases/tag/%s)\n- Cross-compiled ARM64 native binaries with true Linux kernel TUN routing\n- Conflict-free Android fwmarks (0x10020000) with protectedFromVpn bit\n" "$TAG" "$DATE" "$TAG" "$TAG" > "$TEMP_CHANGELOG"
+            if [ -n "$UPSTREAM_BODY" ] && [ "$UPSTREAM_BODY" != "null" ]; then
+              printf "\n> **Upstream Notes**: %s\n" "$UPSTREAM_BODY" >> "$TEMP_CHANGELOG"
+            fi
+            printf "\n" >> "$TEMP_CHANGELOG"
+            if [ -f changelog.md ]; then
+              tail -n +3 changelog.md >> "$TEMP_CHANGELOG"
+            fi
+            mv "$TEMP_CHANGELOG" changelog.md
+          fi
+          
+          # Update update.json for Magisk & KernelSU WebUI
+          printf '{\n  "version": "%s",\n  "versionCode": %s,\n  "zipUrl": "https://github.com/%s/releases/download/%s/tailscale-native.zip",\n  "changelog": "https://raw.githubusercontent.com/%s/main/changelog.md"\n}\n' "$TAG" "$VER_CODE" "${{ github.repository }}" "$TAG" "${{ github.repository }}" > update.json
+          
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add changelog.md update.json module.prop
+          git commit -m "Auto-bump module version and changelog to $TAG [skip ci]" || echo "No changes to commit"
+          git push origin main || echo "Push failed or already up to date"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve-tag.outputs.TAG }}
+          name: Tailscale Native ${{ steps.resolve-tag.outputs.TAG }}
+          body: |
+            Automated native Tailscale ARM64 build based on official upstream [${{ steps.resolve-tag.outputs.TAG }}](https://github.com/tailscale/tailscale/releases/tag/${{ steps.resolve-tag.outputs.TAG }}).
+            
+            ### Included in this Release:
+            - **`tailscale-native.zip`**: Flashable Magisk / KernelSU module (downloads latest binary during installation).
+            - **`tailscale` & `tailscaled`**: Raw ARM64 ELF executables with native TUN routing.
+            - **`last-update.sha256`**: Cryptographic checksums.
+            
+            ### Updating on Device:
+            - **KernelSU / Magisk**: Tap **Action** in the Modules tab to update in-place without rebooting.
+          draft: false
+          prerelease: false
+          files: |
+            dist/tailscale-native.zip
+            dist/tailscale-native-${{ steps.resolve-tag.outputs.TAG }}.zip
+            dist/arm64/tailscale
+            dist/arm64/tailscaled
+            dist/commit
+            dist/last-update.sha256
+
+      - name: Deploy to Prebuilt Branch (For Raw Direct Downloads)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          TEMP_BRANCH="prebuilt"
+          WORK_DIR=$(mktemp -d)
+          cp -r dist/* "$WORK_DIR/"
+          cd "$WORK_DIR"
+          git init
+          git checkout -b "$TEMP_BRANCH"
+          git add -A
+          git commit -m "Automated build for ${{ steps.resolve-tag.outputs.TAG }} (${{ github.sha }})"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -f origin "$TEMP_BRANCH"

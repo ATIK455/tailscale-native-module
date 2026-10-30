@@ -1,0 +1,1798 @@
+diff --git a/cmd/tailscale/cli/cli_test.go b/cmd/tailscale/cli/cli_test.go
+index 6ad7e08..00a128a 100644
+--- a/cmd/tailscale/cli/cli_test.go
++++ b/cmd/tailscale/cli/cli_test.go
+@@ -146,7 +146,7 @@ func TestCutWord(t *testing.T) {
+ // geese is a collection of gooses. It need not be complete.
+ // But it should include anything handled specially (e.g. linux, windows)
+ // and at least one thing that's not (darwin, freebsd).
+-var geese = []string{"linux", "darwin", "windows", "freebsd"}
++var geese = []string{"linux", "android", "darwin", "windows", "freebsd"}
+ 
+ // Test that checkForAccidentalSettingReverts's updateMaskedPrefsFromUpFlag can handle
+ // all flags. This will panic if a new flag creeps in that's unhandled.
+@@ -690,6 +690,27 @@ func upArgsFromOSArgs(goos string, flagArgs ...string) (args upArgsT) {
+ 	return
+ }
+ 
++func TestAndroidUpRoutingPrefs(t *testing.T) {
++	for _, mode := range []string{"on", "nodivert", "off"} {
++		t.Run(mode, func(t *testing.T) {
++			args := upArgsFromOSArgs("android", "--snat-subnet-routes=false", "--stateful-filtering=true", "--netfilter-mode="+mode)
++			prefs, err := prefsFromUpArgs(args, t.Logf, new(ipnstate.Status), "android")
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !prefs.NoSNAT || !prefs.NoStatefulFiltering.EqualBool(false) || prefs.NetfilterMode.String() != mode {
++				t.Fatalf("Android routing flags were not applied: %s", prefs.Pretty())
++			}
++			// The same values must be included when checking subsequent 'up'
++			// invocations for accidental preference changes.
++			flags := prefsToFlags(upCheckEnv{goos: "android"}, prefs)
++			if flags["snat-subnet-routes"] != false || flags["stateful-filtering"] != true || flags["netfilter-mode"] != mode {
++				t.Fatalf("routing flags missing from preference comparison: %v", flags)
++			}
++		})
++	}
++}
++
+ func TestPrefsFromUpArgs(t *testing.T) {
+ 	tests := []struct {
+ 		name     string
+diff --git a/cmd/tailscale/cli/diag.go b/cmd/tailscale/cli/diag.go
+index 916ea1c..e9aeed0 100644
+--- a/cmd/tailscale/cli/diag.go
++++ b/cmd/tailscale/cli/diag.go
+@@ -65,6 +65,8 @@ func fixTailscaledConnectErrorImpl(origErr error) error {
+ 				hint = " (sudo systemctl start tailscaled ?)"
+ 			}
+ 			return fmt.Errorf("failed to connect to local tailscaled; it doesn't appear to be running%s", hint)
++		case "android":
++			return fmt.Errorf("failed to connect to local Tailscale service; are you root? is Tailscale running? (hint: setprop ctl.start tailscaled)")
+ 		}
+ 		return fmt.Errorf("failed to connect to local tailscaled process; it doesn't appear to be running")
+ 	}
+diff --git a/cmd/tailscale/cli/set.go b/cmd/tailscale/cli/set.go
+index ff2458b..7c64cfe 100644
+--- a/cmd/tailscale/cli/set.go
++++ b/cmd/tailscale/cli/set.go
+@@ -113,7 +113,7 @@ func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
+ 		setf.StringVar(&setArgs.opUser, "operator", "", "Unix username to allow to operate on tailscaled without sudo")
+ 	}
+ 	switch goos {
+-	case "linux":
++	case "linux", "android":
+ 		setf.BoolVar(&setArgs.snat, "snat-subnet-routes", true, "source NAT traffic to local routes advertised with --advertise-routes")
+ 		setf.BoolVar(&setArgs.statefulFiltering, "stateful-filtering", false, "apply stateful filtering to forwarded packets (subnet routers, exit nodes, and so on)")
+ 		setf.StringVar(&setArgs.netfilterMode, "netfilter-mode", defaultNetfilterMode(), "netfilter mode (one of on, nodivert, off)")
+@@ -172,7 +172,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
+ 		},
+ 	}
+ 
+-	if effectiveGOOS() == "linux" {
++	if goos := effectiveGOOS(); goos == "linux" || goos == "android" {
+ 		nfMode, warning, err := netfilterModeFromFlag(setArgs.netfilterMode)
+ 		if err != nil {
+ 			return err
+diff --git a/cmd/tailscale/cli/set_test.go b/cmd/tailscale/cli/set_test.go
+index e2c3ae5..2425c87 100644
+--- a/cmd/tailscale/cli/set_test.go
++++ b/cmd/tailscale/cli/set_test.go
+@@ -4,15 +4,72 @@
+ package cli
+ 
+ import (
++	"context"
++	"encoding/json"
+ 	"flag"
++	"net"
++	"net/http"
++	"net/http/httptest"
+ 	"net/netip"
+ 	"reflect"
+ 	"testing"
+ 
++	"tailscale.com/client/local"
+ 	"tailscale.com/ipn"
+ 	"tailscale.com/net/tsaddr"
++	"tailscale.com/tstest"
++	"tailscale.com/types/preftype"
+ )
+ 
++func TestAndroidSetRoutingPrefs(t *testing.T) {
++	t.Setenv("TS_DEBUG_UP_FLAG_GOOS", "android")
++	tstest.Replace(t, &setArgs, setArgsT{})
++	tstest.Replace(t, &setFlagSet, newSetFlagSet("android", &setArgs))
++	if err := setFlagSet.Parse([]string{"--netfilter-mode=nodivert", "--snat-subnet-routes=false", "--stateful-filtering=true"}); err != nil {
++		t.Fatal(err)
++	}
++	editRequests := make(chan ipn.MaskedPrefs, 1)
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch r.Method + " " + r.URL.Path {
++		case "GET /localapi/v0/status", "GET /localapi/v0/prefs", "POST /localapi/v0/check-prefs":
++		case "PATCH /localapi/v0/prefs":
++			var edits ipn.MaskedPrefs
++			if err := json.NewDecoder(r.Body).Decode(&edits); err != nil {
++				t.Error(err)
++				http.Error(w, err.Error(), http.StatusBadRequest)
++				return
++			}
++			editRequests <- edits
++		default:
++			t.Errorf("unexpected LocalAPI request: %s %s", r.Method, r.URL.Path)
++			http.NotFound(w, r)
++			return
++		}
++		w.Write([]byte(`{}`))
++	}))
++	defer srv.Close()
++	tstest.Replace(t, &localClient, local.Client{
++		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
++			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
++		},
++	})
++	if err := runSet(t.Context(), nil); err != nil {
++		t.Fatal(err)
++	}
++	var edits ipn.MaskedPrefs
++	select {
++	case edits = <-editRequests:
++	default:
++		t.Fatal("no preference update sent to LocalAPI")
++	}
++	if !edits.NetfilterModeSet || edits.NetfilterMode != preftype.NetfilterNoDivert ||
++		!edits.NoSNATSet || !edits.NoSNAT ||
++		!edits.NoStatefulFilteringSet || !edits.NoStatefulFiltering.EqualBool(false) {
++		t.Fatalf("incorrect routing preferences sent to LocalAPI: %s", edits.Pretty())
++	}
++}
++
+ func TestCalcAdvertiseRoutesForSet(t *testing.T) {
+ 	pfx := netip.MustParsePrefix
+ 	tests := []struct {
+diff --git a/cmd/tailscale/cli/up.go b/cmd/tailscale/cli/up.go
+index 0b0d93d..d4c4add 100644
+--- a/cmd/tailscale/cli/up.go
++++ b/cmd/tailscale/cli/up.go
+@@ -124,7 +124,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
+ 		upf.StringVar(&upArgs.opUser, "operator", "", "Unix username to allow to operate on tailscaled without sudo")
+ 	}
+ 	switch goos {
+-	case "linux":
++	case "linux", "android":
+ 		upf.BoolVar(&upArgs.snat, "snat-subnet-routes", true, "source NAT traffic to local routes advertised with --advertise-routes")
+ 		upf.BoolVar(&upArgs.statefulFiltering, "stateful-filtering", false, "apply stateful filtering to forwarded packets (subnet routers, exit nodes, and so on)")
+ 		upf.StringVar(&upArgs.netfilterMode, "netfilter-mode", defaultNetfilterMode(), "netfilter mode (one of on, nodivert, off)")
+@@ -363,7 +363,7 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
+ 	prefs.AppConnector.Advertise = upArgs.advertiseConnector
+ 	prefs.PostureChecking = upArgs.postureChecking
+ 
+-	if goos == "linux" || goos == "freebsd" {
++	if goos == "linux" || goos == "android" || goos == "freebsd" {
+ 		prefs.NoSNAT = !upArgs.snat
+ 		// We want to make sure user is aware setting --snat-subnet-routes=false with --advertise-exit-node would break exitnode,
+ 		// but we won't prevent them from doing it since there are current dependencies on that combination. (as of 2026-03-25)
+@@ -371,7 +371,7 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
+ 			warnf("--snat-subnet-routes=false is set with --advertise-exit-node; internet traffic through this exit node may not work as expected")
+ 		}
+ 	}
+-	if goos == "linux" {
++	if goos == "linux" || goos == "android" {
+ 		// Backfills for NoStatefulFiltering occur when loading a profile; just set it explicitly here.
+ 		prefs.NoStatefulFiltering.Set(!upArgs.statefulFiltering)
+ 		v, warning, err := netfilterModeFromFlag(upArgs.netfilterMode)
+@@ -1126,9 +1126,9 @@ func applyImplicitPrefs(prefs, oldPrefs *ipn.Prefs, env upCheckEnv) {
+ func flagAppliesToOS(flag, goos string) bool {
+ 	switch flag {
+ 	case "netfilter-mode", "stateful-filtering":
+-		return goos == "linux"
++		return goos == "linux" || goos == "android"
+ 	case "snat-subnet-routes":
+-		return goos == "linux" || goos == "freebsd"
++		return goos == "linux" || goos == "android" || goos == "freebsd"
+ 	case "unattended":
+ 		return goos == "windows"
+ 	}
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index 1b0ee60..11ddfd7 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -913,11 +913,11 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
+ 			return false, err
+ 		}
+ 
+-		if runtime.GOOS == "plan9" || runtime.GOOS == "linux" {
++		if runtime.GOOS == "plan9" || runtime.GOOS == "linux" || runtime.GOOS == "android" {
+ 			// TODO(bradfitz): why don't we do this on all platforms?
+ 			// TODO(barnstar): we do it on sandboxed darwin now
+-			// We should. Doing it just on plan9 and Linux for now conservatively.
+-			// Linux needs it for the serve and web client listeners, which
++			// We should. Doing it just on plan9, Linux and AOSP for now conservatively.
++			// Linux and AOSP need it for the serve and web client listeners, which
+ 			// require the Tailscale interface index to bind to.
+ 			netmon.SetTailscaleInterfaceProps(devName, 0)
+ 		}
+diff --git a/envknob/envknob.go b/envknob/envknob.go
+index b0e35f5..a473884 100644
+--- a/envknob/envknob.go
++++ b/envknob/envknob.go
+@@ -634,6 +634,8 @@ func getPlatformEnvFiles() []string {
+ 		if buildfeatures.HasSynology && distro.Get() == distro.Synology {
+ 			return []string{"/etc/tailscale/tailscaled-env.txt"}
+ 		}
++	case "android":
++		return []string{"/data/tailscale/tailscaled-env.txt"}
+ 	case "darwin":
+ 		if version.IsSandboxedMacOS() { // the two GUI variants (App Store or separate download)
+ 			// On the App Store variant, the home directory is set
+diff --git a/envknob/featureknob/featureknob.go b/envknob/featureknob/featureknob.go
+index 0493665..083e4e0 100644
+--- a/envknob/featureknob/featureknob.go
++++ b/envknob/featureknob/featureknob.go
+@@ -31,6 +31,8 @@ func CanRunTailscaleSSH() error {
+ 		if version.IsSandboxedMacOS() {
+ 			return errors.New("The Tailscale SSH server does not run in sandboxed Tailscale GUI builds.")
+ 		}
++	case "android":
++		return nil
+ 	case "freebsd", "openbsd", "plan9":
+ 	default:
+ 		return errors.New("The Tailscale SSH server is not supported on " + runtime.GOOS)
+diff --git a/feature/ssh/ssh.go b/feature/ssh/ssh.go
+index b772db0..2d4d49a 100644
+--- a/feature/ssh/ssh.go
++++ b/feature/ssh/ssh.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build ((linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9) && !ts_omit_ssh
++//go:build (linux || (darwin && !ios) || freebsd || openbsd || plan9) && !ts_omit_ssh
+ 
+ // Package ssh registers the Tailscale SSH feature, including host key
+ // management and the SSH server.
+diff --git a/feature/taildrop/fileops_fs.go b/feature/taildrop/fileops_fs.go
+index 3ddf95d..070d12c 100644
+--- a/feature/taildrop/fileops_fs.go
++++ b/feature/taildrop/fileops_fs.go
+@@ -1,6 +1,5 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+-//go:build !android
+ 
+ package taildrop
+ 
+diff --git a/ipn/conffile/conffile.go b/ipn/conffile/conffile.go
+index 8586c57..a47c56e 100644
+--- a/ipn/conffile/conffile.go
++++ b/ipn/conffile/conffile.go
+@@ -57,7 +57,7 @@ func (c *Config) WantRunning() bool {
+ // Load reads and parses the config file at the provided path on disk.
+ func Load(path string) (*Config, error) {
+ 	switch runtime.GOOS {
+-	case "ios", "android":
++	case "ios":
+ 		// compile-time for deadcode elimination
+ 		return nil, fmt.Errorf("config file loading not supported on %q", runtime.GOOS)
+ 	}
+diff --git a/ipn/conffile/conffile_hujson.go b/ipn/conffile/conffile_hujson.go
+index 4f4613d..f896b0e 100644
+--- a/ipn/conffile/conffile_hujson.go
++++ b/ipn/conffile/conffile_hujson.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !ios && !android && !ts_omit_hujsonconf
++//go:build !ios && !ts_omit_hujsonconf
+ 
+ package conffile
+ 
+@@ -10,7 +10,7 @@
+ // Only link the hujson package on platforms that use it, to reduce binary size
+ // & memory a bit.
+ //
+-// (iOS and Android don't have config files)
++// (iOS doesn't have config files; the AOSP daemon does.)
+ 
+ // While the linker's deadcode mostly handles the hujson package today, this
+ // keeps us honest for the future.
+diff --git a/ipn/ipnauth/android_app.go b/ipn/ipnauth/android_app.go
+new file mode 100644
+index 0000000..03570ad
+--- /dev/null
++++ b/ipn/ipnauth/android_app.go
+@@ -0,0 +1,38 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build android
++
++package ipnauth
++
++import (
++	"net"
++
++	"golang.org/x/sys/unix"
++)
++
++// IsAndroidApp reports whether this Unix socket's peer is the platform-signed
++// Tailscale UI. Android assigns the domain using the package name AND signing
++// identity in seapp_contexts. Never trust a UID supplied in an HTTP header or
++// grant access to every app signed with the platform key.
++func (ci *ConnIdentity) IsAndroidApp() bool {
++	conn, ok := ci.conn.(*net.UnixConn)
++	if !ok {
++		return false
++	}
++	raw, err := conn.SyscallConn()
++	if err != nil {
++		return false
++	}
++	var label string
++	var sockErr error
++	err = raw.Control(func(fd uintptr) {
++		label, sockErr = unix.GetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_PEERSEC)
++	})
++	if err != nil || sockErr != nil {
++		return false
++	}
++	// Only the primary Android user controls the system-wide daemon. Secondary
++	// users have a different MLS category; isolated processes have another domain.
++	return isAndroidAppContext(label)
++}
+diff --git a/ipn/ipnauth/android_app_context.go b/ipn/ipnauth/android_app_context.go
+new file mode 100644
+index 0000000..bdedc21
+--- /dev/null
++++ b/ipn/ipnauth/android_app_context.go
+@@ -0,0 +1,13 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++package ipnauth
++
++import "strings"
++
++func isAndroidAppContext(label string) bool {
++	// libselinux LEVELFROM_USER assigns c512,c768 to Android user 0.
++	// Compare the entire context: a domain-name substring would accept other
++	// Android users or an unrelated type containing "tailscale_app".
++	return strings.TrimRight(label, "\x00") == "u:r:tailscale_app:s0:c512,c768"
++}
+diff --git a/ipn/ipnauth/android_app_context_test.go b/ipn/ipnauth/android_app_context_test.go
+new file mode 100644
+index 0000000..765edb0
+--- /dev/null
++++ b/ipn/ipnauth/android_app_context_test.go
+@@ -0,0 +1,26 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++package ipnauth
++
++import "testing"
++
++func TestAndroidAppContext(t *testing.T) {
++	for _, tt := range []struct {
++		label string
++		want  bool
++	}{
++		{"u:r:tailscale_app:s0:c512,c768", true},
++		{"u:r:tailscale_app:s0:c512,c768\x00", true},
++		{"u:r:tailscale_app:s0:c513,c768", false},
++		{"u:r:tailscale_app:s0", false},
++		{"u:r:untrusted_app:s0:c512,c768", false},
++		{"u:r:platform_app:s0:c512,c768", false},
++		{"u:r:fake_tailscale_app:s0:c512,c768", false},
++		{"", false},
++	} {
++		if got := isAndroidAppContext(tt.label); got != tt.want {
++			t.Errorf("isAndroidAppContext(%q) = %v, want %v", tt.label, got, tt.want)
++		}
++	}
++}
+diff --git a/ipn/ipnauth/android_app_notandroid.go b/ipn/ipnauth/android_app_notandroid.go
+new file mode 100644
+index 0000000..7fba479
+--- /dev/null
++++ b/ipn/ipnauth/android_app_notandroid.go
+@@ -0,0 +1,8 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !android
++
++package ipnauth
++
++func (ci *ConnIdentity) IsAndroidApp() bool { return false }
+diff --git a/ipn/ipnauth/android_app_test.go b/ipn/ipnauth/android_app_test.go
+new file mode 100644
+index 0000000..b49822d
+--- /dev/null
++++ b/ipn/ipnauth/android_app_test.go
+@@ -0,0 +1,74 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build android
++
++package ipnauth
++
++import (
++	"net"
++	"os"
++	"path/filepath"
++	"strconv"
++	"testing"
++
++	"golang.org/x/sys/unix"
++	"tailscale.com/safesocket"
++)
++
++func TestAndroidSocketIdentity(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "tailscaled.sock")
++	ln, err := safesocket.Listen(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	fi, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if fi.Mode().Perm() != 0666 {
++		t.Fatalf("socket permissions = %04o; want 0666 with peer authorization", fi.Mode().Perm())
++	}
++	client, err := net.Dial("unix", path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer client.Close()
++	server, err := ln.Accept()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	ci, err := GetConnIdentity(t.Logf, server)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ci.Creds() == nil {
++		t.Fatal("missing Android peer credentials")
++	}
++	if uid, ok := ci.Creds().UserID(); !ok || uid != strconv.Itoa(os.Getuid()) {
++		t.Fatalf("peer UID = %q, %v; want %d", uid, ok, os.Getuid())
++	}
++	raw, err := server.(*net.UnixConn).SyscallConn()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var label string
++	var sockErr error
++	if err := raw.Control(func(fd uintptr) {
++		label, sockErr = unix.GetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_PEERSEC)
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if sockErr != nil {
++		t.Fatal(sockErr)
++	}
++	if label == "" {
++		t.Fatal("empty Android peer security context")
++	}
++	t.Logf("peer security context: %s", label)
++	if got, want := ci.IsAndroidApp(), isAndroidAppContext(label); got != want {
++		t.Fatalf("IsAndroidApp = %v; want %v for %q", got, want, label)
++	}
++}
+diff --git a/ipn/ipnauth/ipnauth.go b/ipn/ipnauth/ipnauth.go
+index d48ec1f..916a8f0 100644
+--- a/ipn/ipnauth/ipnauth.go
++++ b/ipn/ipnauth/ipnauth.go
+@@ -184,8 +184,8 @@ func (ci *ConnIdentity) IsReadonlyConn(operatorUID string, logf logger.Logf) boo
+ 		logf("connection from peer with unknown userid; read-only")
+ 		return ro
+ 	}
+-	if uid == "0" {
+-		logf("connection from userid %v; root has access", uid)
++	if uid == "0" || ci.IsAndroidApp() {
++		logf("connection from userid %v; root or platform Tailscale app has access", uid)
+ 		return rw
+ 	}
+ 	if selfUID := os.Getuid(); selfUID != 0 && uid == strconv.Itoa(selfUID) {
+diff --git a/ipn/ipnlocal/local.go b/ipn/ipnlocal/local.go
+index de392a3..8ea0d83 100644
+--- a/ipn/ipnlocal/local.go
++++ b/ipn/ipnlocal/local.go
+@@ -6267,16 +6267,15 @@ func shouldUseOneCGNATRoute(logf logger.Logf, mon *netmon.Monitor, controlKnobs
+ 		return true
+ 	}
+ 
+-	// Prefer a single CGNAT route on platforms where updateing the VPN
+-	// configuration is espensive. On macOS, changing the network extension
++	// Prefer a single CGNAT route on macOS, where changing the network extension
+ 	// configuration can disrupt existing connections notably Chrome; see
+-	// https://github.com/tailscale/tailscale/issues/3102). On Android, updating
+-	// VpnService.Builder configuration requires establishing a new VPN interface,
+-	// which tears down long lived TCP connections.
++	// https://github.com/tailscale/tailscale/issues/3102.
++	// The AOSP daemon uses the Linux router rather than VpnService, so Android
++	// keeps individual peer routes just like Linux.
+ 	//
+-	// Only use fine-grained routes if another interfaces is also using the CGNAT
++	// On macOS, only use fine-grained routes if another interface is using the CGNAT
+ 	// IP range.
+-	if versionOS == "macOS" || versionOS == "android" {
++	if versionOS == "macOS" {
+ 		hasCGNATInterface, err := mon.HasCGNATInterface()
+ 		if err != nil {
+ 			logf("shouldUseOneCGNATRoute: Could not determine if any interfaces use CGNAT: %v", err)
+diff --git a/ipn/ipnlocal/local_test.go b/ipn/ipnlocal/local_test.go
+index 48608b3..dfab955 100644
+--- a/ipn/ipnlocal/local_test.go
++++ b/ipn/ipnlocal/local_test.go
+@@ -9596,7 +9596,7 @@ func TestShouldUseOneCGNATRoute(t *testing.T) {
+ 				makeInterface(26, "tun0", "100.95.71.186/32"),
+ 			},
+ 			tsName: "tun0",
+-			want:   true,
++			want:   false,
+ 		},
+ 		{
+ 			name:      "android/multiple-cgnats",
+diff --git a/ipn/ipnlocal/peerapi_linux.go b/ipn/ipnlocal/peerapi_linux.go
+index 9c69cda..f97d931 100644
+--- a/ipn/ipnlocal/peerapi_linux.go
++++ b/ipn/ipnlocal/peerapi_linux.go
+@@ -1,8 +1,6 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build linux && !android
+-
+ package ipnlocal
+ 
+ import (
+diff --git a/ipn/ipnserver/actor.go b/ipn/ipnserver/actor.go
+index 985a6ef..d424e66 100644
+--- a/ipn/ipnserver/actor.go
++++ b/ipn/ipnserver/actor.go
+@@ -111,7 +111,7 @@ func (a *actor) IsLocalSystem() bool {
+ 
+ // IsLocalAdmin implements [ipnauth.Actor].
+ func (a *actor) IsLocalAdmin(operatorUID string) bool {
+-	return a.isLocalSystem || connIsLocalAdmin(a.logf, a.ci, operatorUID)
++	return a.isLocalSystem || (a.ci != nil && a.ci.IsAndroidApp()) || connIsLocalAdmin(a.logf, a.ci, operatorUID)
+ }
+ 
+ // UserID implements [ipnauth.Actor].
+@@ -145,7 +145,7 @@ func (a *actor) Username() (string, error) {
+ 		}
+ 		defer tok.Close()
+ 		return tok.Username()
+-	case "darwin", "linux", "illumos", "solaris", "openbsd", "freebsd":
++	case "darwin", "linux", "android", "illumos", "solaris", "openbsd", "freebsd":
+ 		creds := a.ci.Creds()
+ 		if creds == nil {
+ 			return "", errors.New("peer credentials not implemented on this OS")
+@@ -237,7 +237,7 @@ func connIsLocalAdmin(logf logger.Logf, ci *ipnauth.ConnIdentity, operatorUID st
+ 		// This is a standalone tailscaled setup, use the same logic as on
+ 		// Linux.
+ 		fallthrough
+-	case "linux", "solaris", "illumos":
++	case "linux", "android", "solaris", "illumos":
+ 		if !buildfeatures.HasUnixSocketIdentity {
+ 			// Everybody is an admin if support for unix socket identities
+ 			// is omitted for the build.
+diff --git a/ipn/localapi/cert.go b/ipn/localapi/cert.go
+index 132f7bd..fdd9fac 100644
+--- a/ipn/localapi/cert.go
++++ b/ipn/localapi/cert.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !ios && !android && !js && !ts_omit_acme
++//go:build !ios && !js && !ts_omit_acme
+ 
+ package localapi
+ 
+diff --git a/ipn/localapi/disabled_stubs.go b/ipn/localapi/disabled_stubs.go
+index 0d16de8..c008f7e 100644
+--- a/ipn/localapi/disabled_stubs.go
++++ b/ipn/localapi/disabled_stubs.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build ios || android || js
++//go:build ios || js
+ 
+ package localapi
+ 
+diff --git a/ipn/localapi/localapi_test.go b/ipn/localapi/localapi_test.go
+index a042671..b4f914c 100644
+--- a/ipn/localapi/localapi_test.go
++++ b/ipn/localapi/localapi_test.go
+@@ -602,7 +602,7 @@ func TestShouldDenyServeConfigForGOOSAndUserContext(t *testing.T) {
+ 	}
+ 
+ 	for _, tt := range tests {
+-		for _, goos := range []string{"linux", "windows", "darwin", "illumos", "solaris"} {
++		for _, goos := range []string{"linux", "android", "windows", "darwin", "illumos", "solaris"} {
+ 			t.Run(goos+"-"+tt.name, func(t *testing.T) {
+ 				err := authorizeServeConfigForGOOSAndUserContext(goos, tt.configIn, tt.h)
+ 				gotErr := err != nil
+diff --git a/ipn/localapi/pprof.go b/ipn/localapi/pprof.go
+index fabdb18..510dc8e 100644
+--- a/ipn/localapi/pprof.go
++++ b/ipn/localapi/pprof.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !ios && !android && !js && !ts_omit_debug
++//go:build !ios && !js && !ts_omit_debug
+ 
+ // We don't include it on mobile where we're more memory constrained and
+ // there's no CLI to get at the results anyway.
+diff --git a/ipn/localapi/serve.go b/ipn/localapi/serve.go
+index 5b5c9e9..eb78169 100644
+--- a/ipn/localapi/serve.go
++++ b/ipn/localapi/serve.go
+@@ -79,7 +79,7 @@ func (h *Handler) serveServeConfig(w http.ResponseWriter, r *http.Request) {
+ 
+ func authorizeServeConfigForGOOSAndUserContext(goos string, configIn *ipn.ServeConfig, h *Handler) error {
+ 	switch goos {
+-	case "windows", "linux", "darwin", "illumos", "solaris":
++	case "windows", "linux", "android", "darwin", "illumos", "solaris":
+ 	default:
+ 		return nil
+ 	}
+@@ -99,7 +99,7 @@ func authorizeServeConfigForGOOSAndUserContext(goos string, configIn *ipn.ServeC
+ 	switch goos {
+ 	case "windows":
+ 		return errors.New("must be a Windows local admin to serve a path or Unix socket")
+-	case "linux", "darwin", "illumos", "solaris":
++	case "linux", "android", "darwin", "illumos", "solaris":
+ 		return errors.New("must be root, or be an operator and able to run 'sudo tailscale' to serve a path or Unix socket")
+ 	default:
+ 		// We filter goos at the start of the func, this default case
+diff --git a/net/batching/conn_linux.go b/net/batching/conn_linux.go
+index ccdca10..339641b 100644
+--- a/net/batching/conn_linux.go
++++ b/net/batching/conn_linux.go
+@@ -10,7 +10,6 @@
+ 	"io"
+ 	"net"
+ 	"net/netip"
+-	"runtime"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -645,10 +644,6 @@ func getRXQOverflowsMetric(name string) *clientmetric.Metric {
+ // to a clientmetric with the supplied name. If knobs is non-nil, UDP GSO
+ // and/or UDP GRO may be disabled via control-plane node attributes.
+ func TryUpgradeToConn(pconn nettype.PacketConn, network string, rxqOverflowsMetricName string, knobs *controlknobs.Knobs) nettype.PacketConn {
+-	if runtime.GOOS != "linux" {
+-		// Exclude Android.
+-		return pconn
+-	}
+ 	if network != "udp4" && network != "udp6" {
+ 		return pconn
+ 	}
+diff --git a/net/connreject/connreject.go b/net/connreject/connreject.go
+index 73315ee..aec54f2 100644
+--- a/net/connreject/connreject.go
++++ b/net/connreject/connreject.go
+@@ -294,11 +294,11 @@ func (a *Aggregator) bufFor(d Direction) *dirBuf {
+ }
+ 
+ // DefaultMax returns the default maximum number of entries per
+-// direction. On mobile platforms the default is smaller to respect tight
+-// memory budgets.
++// direction. On iOS and tvOS the default is smaller to respect tight memory
++// budgets. The AOSP daemon uses the same limit as Linux.
+ func DefaultMax() int {
+ 	switch runtime.GOOS {
+-	case "ios", "android", "tvos":
++	case "ios", "tvos":
+ 		return 32
+ 	}
+ 	return 256
+diff --git a/net/neterror/neterror.go b/net/neterror/neterror.go
+index cc9dc59..099b7ad 100644
+--- a/net/neterror/neterror.go
++++ b/net/neterror/neterror.go
+@@ -26,7 +26,7 @@ func TreatAsLostUDP(err error) bool {
+ 		return false
+ 	}
+ 	switch runtime.GOOS {
+-	case "linux":
++	case "linux", "android":
+ 		// Linux, while not documented in the man page,
+ 		// returns EPERM when there's an OUTPUT rule with -j
+ 		// DROP or -j REJECT.  We use this very specific
+diff --git a/net/netmon/interfaces_android.go b/net/netmon/interfaces_android.go
+index 1bd22db..e880bee 100644
+--- a/net/netmon/interfaces_android.go
++++ b/net/netmon/interfaces_android.go
+@@ -1,6 +1,8 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
++//go:build ignore
++
+ package netmon
+ 
+ import (
+diff --git a/net/netmon/interfaces_linux.go b/net/netmon/interfaces_linux.go
+index 64cb0b9..cf9a9f6 100644
+--- a/net/netmon/interfaces_linux.go
++++ b/net/netmon/interfaces_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !android
++//go:build linux
+ 
+ package netmon
+ 
+diff --git a/net/netmon/netmon_linux.go b/net/netmon/netmon_linux.go
+index b7d87f9..591a412 100644
+--- a/net/netmon/netmon_linux.go
++++ b/net/netmon/netmon_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !android
++//go:build linux
+ 
+ package netmon
+ 
+diff --git a/net/netmon/netmon_polling.go b/net/netmon/netmon_polling.go
+index bdeb430..c5f7989 100644
+--- a/net/netmon/netmon_polling.go
++++ b/net/netmon/netmon_polling.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (!linux && !freebsd && !windows && !darwin) || android
++//go:build !linux && !freebsd && !windows && !darwin
+ 
+ package netmon
+ 
+diff --git a/net/netns/netns_android.go b/net/netns/netns_android.go
+index 7c5fe32..f587ec1 100644
+--- a/net/netns/netns_android.go
++++ b/net/netns/netns_android.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build android
++//go:build ignore
+ 
+ package netns
+ 
+diff --git a/net/netns/netns_linux.go b/net/netns/netns_linux.go
+index c9ea740..58b6a32 100644
+--- a/net/netns/netns_linux.go
++++ b/net/netns/netns_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build linux && !android
++//go:build linux
+ 
+ package netns
+ 
+diff --git a/net/tstun/wrap_linux.go b/net/tstun/wrap_linux.go
+index 3fbeb35..57f5d5c 100644
+--- a/net/tstun/wrap_linux.go
++++ b/net/tstun/wrap_linux.go
+@@ -8,7 +8,6 @@
+ import (
+ 	"errors"
+ 	"net/netip"
+-	"runtime"
+ 
+ 	"github.com/tailscale/wireguard-go/tun"
+ 	"golang.org/x/sys/unix"
+@@ -25,7 +24,7 @@
+ // nil), and OS feature tests. Callers should ensure t is up prior to calling,
+ // otherwise OS feature tests may be inconclusive.
+ func (t *Wrapper) SetLinkFeaturesPostUp(knobs *controlknobs.Knobs) {
+-	if t.isTAP || runtime.GOOS == "android" {
++	if t.isTAP {
+ 		return
+ 	}
+ 	if groDev, ok := t.tdev.(tun.GRODevice); ok {
+@@ -56,7 +55,7 @@ func (t *Wrapper) SetLinkFeaturesPostUp(knobs *controlknobs.Knobs) {
+ // move TUN UDP/TCP GRO from enabled to disabled, but the reverse requires a
+ // client restart.
+ func (t *Wrapper) ApplyGROKnobs(knobs *controlknobs.Knobs) {
+-	if t.isTAP || runtime.GOOS == "android" || knobs == nil {
++	if t.isTAP || knobs == nil {
+ 		return
+ 	}
+ 	groDev, ok := t.tdev.(tun.GRODevice)
+diff --git a/net/tstun/wrap_linux_test.go b/net/tstun/wrap_linux_test.go
+new file mode 100644
+index 0000000..0fc3b99
+--- /dev/null
++++ b/net/tstun/wrap_linux_test.go
+@@ -0,0 +1,67 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build linux && !ts_omit_gro
++
++package tstun
++
++import (
++	"testing"
++
++	"github.com/tailscale/wireguard-go/tun"
++	"golang.org/x/sys/unix"
++	"tailscale.com/control/controlknobs"
++)
++
++type groTestDevice struct {
++	tun.Device
++	udpDisabled, tcpDisabled bool
++	probeErr                 error
++}
++
++func (d *groTestDevice) DisableUDPGRO() { d.udpDisabled = true }
++func (d *groTestDevice) DisableTCPGRO() { d.tcpDisabled = true }
++func (d *groTestDevice) Write(bufs [][]byte, offset int) (int, error) {
++	return len(bufs), d.probeErr
++}
++
++// This test also builds for Android, where the AOSP daemon uses a Linux TUN.
++func TestTUNGROControls(t *testing.T) {
++	t.Setenv("TS_TUN_DISABLE_UDP_GRO", "false")
++	t.Setenv("TS_TUN_DISABLE_TCP_GRO", "false")
++	t.Run("startup-knob-and-live-update", func(t *testing.T) {
++		dev := new(groTestDevice)
++		w := &Wrapper{tdev: dev, logf: t.Logf}
++		knobs := new(controlknobs.Knobs)
++		knobs.DisableTUNUDPGRO.Store(true)
++		w.SetLinkFeaturesPostUp(knobs)
++		if !dev.udpDisabled || dev.tcpDisabled {
++			t.Fatalf("startup: UDP disabled=%v, TCP disabled=%v", dev.udpDisabled, dev.tcpDisabled)
++		}
++		knobs.DisableTUNTCPGRO.Store(true)
++		w.ApplyGROKnobs(knobs)
++		if !dev.tcpDisabled {
++			t.Fatal("live control change did not disable TCP GRO")
++		}
++	})
++	t.Run("unsupported-kernel", func(t *testing.T) {
++		dev := &groTestDevice{probeErr: unix.EINVAL}
++		w := &Wrapper{tdev: dev, logf: t.Logf}
++		w.SetLinkFeaturesPostUp(nil)
++		if !dev.udpDisabled || !dev.tcpDisabled {
++			t.Fatal("failed GRO probe must disable both TCP and UDP GRO")
++		}
++	})
++	t.Run("tap", func(t *testing.T) {
++		dev := new(groTestDevice)
++		w := &Wrapper{tdev: dev, logf: t.Logf, isTAP: true}
++		knobs := new(controlknobs.Knobs)
++		knobs.DisableTUNUDPGRO.Store(true)
++		knobs.DisableTUNTCPGRO.Store(true)
++		w.SetLinkFeaturesPostUp(knobs)
++		w.ApplyGROKnobs(knobs)
++		if dev.udpDisabled || dev.tcpDisabled {
++			t.Fatal("TUN GRO controls must not be applied to TAP devices")
++		}
++	})
++}
+diff --git a/paths/paths.go b/paths/paths.go
+index 77605a1..d43a25e 100644
+--- a/paths/paths.go
++++ b/paths/paths.go
+@@ -63,12 +63,7 @@ func DefaultTailscaledSocket() string {
+ 		return "/srv/tailscaled.sock"
+ 	}
+ 	if runtime.GOOS == "android" {
+-		// Android (e.g. a userspace tailscaled under Termux) has no /var,
+-		// and the cwd-relative fallback below only works when the daemon
+-		// and the CLI happen to be started from the same directory
+-		// (see #21161). Use the shared per-app temp directory so both
+-		// agree on an absolute path.
+-		return filepath.Join(os.TempDir(), "tailscaled.sock")
++		return "/data/tailscale/tailscaled.sock"
+ 	}
+ 	switch distro.Get() {
+ 	case distro.Synology:
+@@ -143,7 +138,8 @@ func MakeAutomaticStateDir() bool {
+ 
+ // MkStateDir ensures that dirPath, the daemon's configuration directory
+ // containing machine keys etc, both exists and has the correct permissions.
+-// We want it to only be accessible to the user the daemon is running under.
++// It is private to the daemon's user, except that Android's default directory
++// permits traversal to the LocalAPI socket. State files remain private.
+ func MkStateDir(dirPath string) error {
+ 	if err := os.MkdirAll(dirPath, 0700); err != nil {
+ 		return err
+diff --git a/paths/paths_unix.go b/paths/paths_unix.go
+index b1556b2..15f28a8 100644
+--- a/paths/paths_unix.go
++++ b/paths/paths_unix.go
+@@ -33,6 +33,8 @@ func statePath() string {
+ 		return "/Library/Tailscale/tailscaled.state"
+ 	case "aix":
+ 		return "/var/tailscale/tailscaled.state"
++	case "android":
++		return "/data/tailscale/tailscaled.state"
+ 	default:
+ 		return ""
+ 	}
+@@ -72,6 +74,21 @@ func xdgDataHome() string {
+ }
+ 
+ func ensureStateDirPermsUnix(dir string) error {
++	return ensureStateDirMode(dir, stateDirPermForOS(dir, runtime.GOOS))
++}
++
++func stateDirPermForOS(dir, goos string) os.FileMode {
++	// Android keeps the LocalAPI socket in the default state directory. Allow
++	// traversal to that socket, but not directory listing or modification.
++	// State files remain 0600; SELinux and SO_PEERSEC restrict socket access.
++	// This must agree with init: NewFileStore reapplies permissions at startup.
++	if goos == "android" && filepath.Clean(dir) == "/data/tailscale" {
++		return 0711
++	}
++	return 0700
++}
++
++func ensureStateDirMode(dir string, perm os.FileMode) error {
+ 	if filepath.Base(dir) != "tailscale" {
+ 		return nil
+ 	}
+@@ -82,7 +99,6 @@ func ensureStateDirPermsUnix(dir string) error {
+ 	if !fi.IsDir() {
+ 		return fmt.Errorf("expected %q to be a directory; is %v", dir, fi.Mode())
+ 	}
+-	const perm = 0700
+ 	if fi.Mode().Perm() == perm {
+ 		// Already correct.
+ 		return nil
+diff --git a/paths/paths_unix_test.go b/paths/paths_unix_test.go
+new file mode 100644
+index 0000000..441fd58
+--- /dev/null
++++ b/paths/paths_unix_test.go
+@@ -0,0 +1,66 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !windows && !wasm && !plan9 && !tamago
++
++package paths
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestStateDirPermissions(t *testing.T) {
++	for _, tt := range []struct {
++		name, goos, path string
++		want             os.FileMode
++	}{
++		{"android-system", "android", "/data/tailscale", 0711},
++		{"android-system-cleaned", "android", "/data/tailscale/", 0711},
++		{"android-custom", "android", "/data/private/tailscale", 0700},
++		{"linux", "linux", "/data/tailscale", 0700},
++		{"darwin", "darwin", "/data/tailscale", 0700},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			mode := stateDirPermForOS(tt.path, tt.goos)
++			if mode != tt.want {
++				t.Fatalf("state directory mode = %04o; want %04o", mode, tt.want)
++			}
++			dir := filepath.Join(t.TempDir(), "tailscale")
++			if err := os.Mkdir(dir, 0700); err != nil {
++				t.Fatal(err)
++			}
++			state := filepath.Join(dir, "tailscaled.state")
++			if err := os.WriteFile(state, []byte("private state"), 0600); err != nil {
++				t.Fatal(err)
++			}
++			// Exercise migration from old init permissions and repeated daemon
++			// startups: the directory must stay traversable on Android.
++			for _, initial := range []os.FileMode{0700, 0770, 0711} {
++				if err := os.Chmod(dir, initial); err != nil {
++					t.Fatal(err)
++				}
++				for range 2 {
++					if err := ensureStateDirMode(dir, mode); err != nil {
++						t.Fatal(err)
++					}
++					fi, err := os.Stat(dir)
++					if err != nil {
++						t.Fatal(err)
++					}
++					if fi.Mode().Perm() != tt.want {
++						t.Fatalf("directory mode = %04o; want %04o", fi.Mode().Perm(), tt.want)
++					}
++				}
++			}
++			fi, err := os.Stat(state)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if fi.Mode().Perm() != 0600 {
++				t.Fatalf("state mode = %04o; want 0600", fi.Mode().Perm())
++			}
++		})
++	}
++}
+diff --git a/portlist/portlist_linux.go b/portlist/portlist_linux.go
+index 794c876..483dde4 100644
+--- a/portlist/portlist_linux.go
++++ b/portlist/portlist_linux.go
+@@ -101,7 +101,7 @@ func newLinuxImplWithDiag(includeLocalhost, useDiag bool) *linuxImpl {
+ 	// /proc/net is resolved through /proc/self, which denotes the process
+ 	// leader. inet_diag is scoped to the calling thread's namespace. If those
+ 	// views differ, use the complete proc fallback rather than mixing them.
+-	if !useDiag || runtime.GOOS == "android" || (procErr != nil || threadErr != nil || threadNS != li.namespace) {
++	if !useDiag || (procErr != nil || threadErr != nil || threadNS != li.namespace) {
+ 		li.diagPermanent = true
+ 	} else {
+ 		li.initDiag()
+@@ -173,12 +173,6 @@ func (li *linuxImpl) Close() error {
+ var eofReader = bytes.NewReader(nil)
+ 
+ func (li *linuxImpl) AppendListeningPorts(base []Port) ([]Port, error) {
+-	if runtime.GOOS == "android" {
+-		// Android 10+ doesn't allow access to this anymore.
+-		// https://developer.android.com/about/versions/10/privacy/changes#proc-net-filesystem
+-		// Ignore it rather than have the system log about our violation.
+-		return nil, nil
+-	}
+ 	br := li.br
+ 	defer br.Reset(eofReader)
+ 
+diff --git a/safesocket/basic_test.go b/safesocket/basic_test.go
+index 05ed98a..cc2b0d4 100644
+--- a/safesocket/basic_test.go
++++ b/safesocket/basic_test.go
+@@ -11,6 +11,21 @@
+ 	"testing"
+ )
+ 
++func TestGOOSUsesPeerCreds(t *testing.T) {
++	// Android uses Linux SO_PEERCRED. Omitting it both makes the socket
++	// root-only and bypasses IsReadonlyConn's peer authorization checks.
++	for _, goos := range []string{"android", "linux", "darwin", "freebsd"} {
++		if !GOOSUsesPeerCreds(goos) {
++			t.Errorf("GOOSUsesPeerCreds(%q) = false", goos)
++		}
++	}
++	for _, goos := range []string{"windows", "plan9", "js"} {
++		if GOOSUsesPeerCreds(goos) {
++			t.Errorf("GOOSUsesPeerCreds(%q) = true", goos)
++		}
++	}
++}
++
+ func TestBasics(t *testing.T) {
+ 	// Make the socket in a temp dir rather than the cwd
+ 	// so that the test can be run from a mounted filesystem (#2367).
+diff --git a/safesocket/safesocket.go b/safesocket/safesocket.go
+index b7ca22c..cedb390 100644
+--- a/safesocket/safesocket.go
++++ b/safesocket/safesocket.go
+@@ -154,7 +154,7 @@ func PlatformUsesPeerCreds() bool {
+ // runtime.GOOS value instead of using the current one.
+ func GOOSUsesPeerCreds(goos string) bool {
+ 	switch goos {
+-	case "linux", "darwin", "freebsd", "solaris", "illumos":
++	case "linux", "android", "darwin", "freebsd", "solaris", "illumos":
+ 		return true
+ 	}
+ 	return false
+diff --git a/ssh/tailssh/auditd_linux.go b/ssh/tailssh/auditd_linux.go
+index bddb901..66e5084 100644
+--- a/ssh/tailssh/auditd_linux.go
++++ b/ssh/tailssh/auditd_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build linux && !android
++//go:build linux
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/c2n.go b/ssh/tailssh/c2n.go
+index 3a1d897..2af5e21 100644
+--- a/ssh/tailssh/c2n.go
++++ b/ssh/tailssh/c2n.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+ 
+ package tailssh
+ 
+@@ -108,6 +108,8 @@ func getSSHUsernames(b *ipnlocal.LocalBackend, req *tailcfg.C2NSSHUsernamesReque
+ 			}
+ 			add(string(line))
+ 		}
++	case "android":
++		add("shell")
+ 	default:
+ 		if hookLocalUsernames != nil {
+ 			names, err := hookLocalUsernames()
+diff --git a/ssh/tailssh/connmonitor.go b/ssh/tailssh/connmonitor.go
+index 43b280b..56c7cc4 100644
+--- a/ssh/tailssh/connmonitor.go
++++ b/ssh/tailssh/connmonitor.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++//go:build linux || (darwin && !ios) || freebsd || openbsd
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/fwdchild.go b/ssh/tailssh/fwdchild.go
+index 3eda5c3..47f6c6e 100644
+--- a/ssh/tailssh/fwdchild.go
++++ b/ssh/tailssh/fwdchild.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++//go:build linux || (darwin && !ios) || freebsd || openbsd
+ 
+ // The ssh-monitor spawns forwarding children as "tailscaled
+ // be-child ssh-fwd", one per dial/listen op.
+diff --git a/ssh/tailssh/fwdmonitor.go b/ssh/tailssh/fwdmonitor.go
+index 0cf6461..b514eff 100644
+--- a/ssh/tailssh/fwdmonitor.go
++++ b/ssh/tailssh/fwdmonitor.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++//go:build linux || (darwin && !ios) || freebsd || openbsd
+ 
+ // The monitor-backed forwarding paths. On unix, all forwarded sockets are
+ // dialed and bound by one-shot children of the per-connection ssh-monitor
+diff --git a/ssh/tailssh/hostkeys.go b/ssh/tailssh/hostkeys.go
+index c22d3a2..1236ba5 100644
+--- a/ssh/tailssh/hostkeys.go
++++ b/ssh/tailssh/hostkeys.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/incubator.go b/ssh/tailssh/incubator.go
+index 41b1a39..a6a6a45 100644
+--- a/ssh/tailssh/incubator.go
++++ b/ssh/tailssh/incubator.go
+@@ -7,7 +7,7 @@
+ // and groups to the specified `--uid`, `--gid` and `--groups`, and
+ // then launches the requested `--cmd`.
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++//go:build linux || (darwin && !ios) || freebsd || openbsd
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/incubator_linux.go b/ssh/tailssh/incubator_linux.go
+index cff4616..3539ffc 100644
+--- a/ssh/tailssh/incubator_linux.go
++++ b/ssh/tailssh/incubator_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build linux && !android
++//go:build linux
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/listen.go b/ssh/tailssh/listen.go
+index f57f933..ab52d71 100644
+--- a/ssh/tailssh/listen.go
++++ b/ssh/tailssh/listen.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/monitor.go b/ssh/tailssh/monitor.go
+index db5f13c..0517dfc 100644
+--- a/ssh/tailssh/monitor.go
++++ b/ssh/tailssh/monitor.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++//go:build linux || (darwin && !ios) || freebsd || openbsd
+ 
+ // The per-connection privileged ssh-monitor process. tailscaled spawns
+ // it, as "tailscaled be-child ssh-monitor", once a connection is
+diff --git a/ssh/tailssh/monitor_client.go b/ssh/tailssh/monitor_client.go
+index 55de1b9..2cba478 100644
+--- a/ssh/tailssh/monitor_client.go
++++ b/ssh/tailssh/monitor_client.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++//go:build linux || (darwin && !ios) || freebsd || openbsd
+ 
+ // monitorClient is tailscaled's side of the ssh-monitor RPC channel.
+ // It spawns the per-connection monitor process, re-exec'ing the
+diff --git a/ssh/tailssh/monitor_linux.go b/ssh/tailssh/monitor_linux.go
+index 5d972f0..32ffbea 100644
+--- a/ssh/tailssh/monitor_linux.go
++++ b/ssh/tailssh/monitor_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build linux && !android
++//go:build linux
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/monitor_rpc.go b/ssh/tailssh/monitor_rpc.go
+index ca11740..c9b230c 100644
+--- a/ssh/tailssh/monitor_rpc.go
++++ b/ssh/tailssh/monitor_rpc.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++//go:build linux || (darwin && !ios) || freebsd || openbsd
+ 
+ // Monitor RPC wire codec.
+ //
+diff --git a/ssh/tailssh/process_unix.go b/ssh/tailssh/process_unix.go
+index 1c05041..72fb624 100644
+--- a/ssh/tailssh/process_unix.go
++++ b/ssh/tailssh/process_unix.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/session.go b/ssh/tailssh/session.go
+index 5648a73..bf32c22 100644
+--- a/ssh/tailssh/session.go
++++ b/ssh/tailssh/session.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/sessmonitor.go b/ssh/tailssh/sessmonitor.go
+index 5caee0e..1f61fbe 100644
+--- a/ssh/tailssh/sessmonitor.go
++++ b/ssh/tailssh/sessmonitor.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd
++//go:build linux || (darwin && !ios) || freebsd || openbsd
+ 
+ // Session processes are launched by the connection's privileged monitor.
+ // tailscaled keeps the parent I/O descriptors and passes the child's stdio
+diff --git a/ssh/tailssh/sftp.go b/ssh/tailssh/sftp.go
+index d872aed..b05e8c1 100644
+--- a/ssh/tailssh/sftp.go
++++ b/ssh/tailssh/sftp.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/tailssh.go b/ssh/tailssh/tailssh.go
+index 7ae12a5..c48ed5f 100644
+--- a/ssh/tailssh/tailssh.go
++++ b/ssh/tailssh/tailssh.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+ 
+ // Package tailssh is an SSH server integrated into Tailscale.
+ package tailssh
+diff --git a/ssh/tailssh/user.go b/ssh/tailssh/user.go
+index ac20e73..e0d5542 100644
+--- a/ssh/tailssh/user.go
++++ b/ssh/tailssh/user.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+ 
+ package tailssh
+ 
+diff --git a/ssh/tailssh/user_unix.go b/ssh/tailssh/user_unix.go
+index d482b09..32bd8f3 100644
+--- a/ssh/tailssh/user_unix.go
++++ b/ssh/tailssh/user_unix.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
++//go:build linux || (darwin && !ios) || freebsd || openbsd || plan9
+ 
+ package tailssh
+ 
+@@ -86,6 +86,9 @@ func defaultPathForUser(u *userMeta) string {
+ 	if runtime.GOOS == "plan9" {
+ 		return "/bin"
+ 	}
++	if runtime.GOOS == "android" {
++		return "/sbin:/bin:/product/bin:/system_ext/bin:/system/bin:/odm/bin:/vendor/bin"
++	}
+ 	isRoot := isRootUser(u)
+ 	switch distro.Get() {
+ 	case distro.Debian, distro.Crostini:
+diff --git a/tsconst/linuxfw.go b/tsconst/linuxfw.go
+index 3a7a4cf..8201d93 100644
+--- a/tsconst/linuxfw.go
++++ b/tsconst/linuxfw.go
+@@ -22,22 +22,45 @@
+ // The constants are in the iptables/iproute2 string format for
+ // matching and setting the bits, so they can be directly embedded in
+ // commands.
++
++// NOTICE: The marks for generic Linux are modified for Android!
++// AOSP's code for Fwmark allocation is
++// https://android.googlesource.com/platform/system/netd/+/master/include/Fwmark.h
++//
++//	struct {
++//	    unsigned netId          : 16;
++//	    bool explicitlySelected :  1;
++//	    bool protectedFromVpn   :  1;
++//	    Permission permission   :  2;
++//	    bool uidBillingDone     :  1;
++//	    unsigned reserved       :  8;
++//	    unsigned vendor         :  2;  // reserved for vendor
++//	    bool ingress_cpu_wakeup :  1;  // reserved for config_networkWakeupPacketMark/Mask
++//	};
++//
++// The lower 0-20 bits are already allocated.
++// Bit 21-28 is currently unused.
++// In the future,AOSP is likely to use some of the lower bits of the 8 bits.
++// Tailscale currently reserves 8 bits for its own usage but only uses 4 bits.
++// For max compatibility with future AOSP development, we will use the higher 4 bits
++// of the reserved part.
++// In addition to that, we also claim the protectedFromVpn bit to avoid going through system VPN
+ const (
+ 	// The mask for reading/writing the 'firewall mask' bits on a packet.
+ 	// See the comment on the const block on why we only use the third byte.
+ 	//
+ 	// We claim bits 16:23 entirely. For now we only use the lower four
+ 	// bits, leaving the higher 4 bits for future use.
+-	LinuxFwmarkMask    = "0xff0000"
+-	LinuxFwmarkMaskNum = 0xff0000
++	LinuxFwmarkMask    = "0x1e020000"
++	LinuxFwmarkMaskNum = 0x1e020000
+ 
+ 	// Packet is from Tailscale and to a subnet route destination, so
+ 	// is allowed to be routed through this machine.
+-	LinuxSubnetRouteMark    = "0x40000"
+-	LinuxSubnetRouteMarkNum = 0x40000
++	LinuxSubnetRouteMark    = "0x8000000"
++	LinuxSubnetRouteMarkNum = 0x8000000
+ 
+ 	// Packet was originated by tailscaled itself, and must not be
+ 	// routed over the Tailscale network.
+-	LinuxBypassMark    = "0x80000"
+-	LinuxBypassMarkNum = 0x80000
++	LinuxBypassMark    = "0x10020000"
++	LinuxBypassMarkNum = 0x10020000
+ )
+diff --git a/util/linuxfw/iptables.go b/util/linuxfw/iptables.go
+index 3bd2c28..690ebf4 100644
+--- a/util/linuxfw/iptables.go
++++ b/util/linuxfw/iptables.go
+@@ -214,6 +214,9 @@ func clearRules(proto iptables.Protocol, logf logger.Logf) error {
+ 	if err := delTSHook(ipt, "filter", "FORWARD", logf); err != nil {
+ 		errs = append(errs, err)
+ 	}
++	if err := delTSHook(ipt, "mangle", "PREROUTING", logf); err != nil {
++		errs = append(errs, err)
++	}
+ 	if err := delTSHook(ipt, "nat", "POSTROUTING", logf); err != nil {
+ 		errs = append(errs, err)
+ 	}
+@@ -225,6 +228,10 @@ func clearRules(proto iptables.Protocol, logf logger.Logf) error {
+ 		errs = append(errs, err)
+ 	}
+ 
++	if err := delChain(ipt, "mangle", "ts-prerouting"); err != nil {
++		errs = append(errs, err)
++	}
++
+ 	if err := delChain(ipt, "nat", "ts-postrouting"); err != nil {
+ 		errs = append(errs, err)
+ 	}
+diff --git a/util/linuxfw/iptables_runner.go b/util/linuxfw/iptables_runner.go
+index ad983fb..8eb184b 100644
+--- a/util/linuxfw/iptables_runner.go
++++ b/util/linuxfw/iptables_runner.go
+@@ -164,6 +164,9 @@ func (i *iptablesRunner) AddHooks() error {
+ 		if err := divert(ipt, "filter", "FORWARD"); err != nil {
+ 			return err
+ 		}
++		if err := divert(ipt, "mangle", "PREROUTING"); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	for _, ipt := range i.getNATTables() {
+@@ -198,6 +201,9 @@ func (i *iptablesRunner) AddChains() error {
+ 		if err := create(ipt, "filter", "ts-forward"); err != nil {
+ 			return err
+ 		}
++		if err := create(ipt, "mangle", "ts-prerouting"); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	for _, ipt := range i.getNATTables() {
+@@ -223,6 +229,12 @@ func (i *iptablesRunner) AddBase(tunname string) error {
+ 	return nil
+ }
+ 
++var (
++	// from all fwmark 0xc0000/0xcffff lookup rmnet_data2
++	// We only set the permission bits. The lower net-id bits are not set as always.
++	androidSystemPermissionMark = "0xc0000"
++)
++
+ // addBase4 adds some basic IPv4 processing rules to be
+ // supplemented by later calls to other helpers.
+ func (i *iptablesRunner) addBase4(tunname string) error {
+@@ -232,6 +244,13 @@ func (i *iptablesRunner) addBase4(tunname string) error {
+ 		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
+ 	}
+ 
++	// Mark packets from tailscale interface with Android system permission\
++	// We need to do so before routing to meet routing requirement(ANDROID_DEFAULT_NETWORK)
++	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", androidSystemPermissionMark + "/" + androidSystemPermissionMark}
++	if err := i.ipt4.Append("mangle", "ts-prerouting", args...); err != nil {
++		return fmt.Errorf("adding %v in v4/mangle/ts-prerouting: %w", args, err)
++	}
++
+ 	// Forward all traffic from the Tailscale interface, and drop
+ 	// traffic to the tailscale interface by default. We use packet
+ 	// marks here so both filter/FORWARD and nat/POSTROUTING can match
+@@ -358,6 +377,12 @@ func (i *iptablesRunner) addBase6(tunname string) error {
+ 		return fmt.Errorf("adding %v in v6/filter/ts-input: %w", args, err)
+ 	}
+ 
++	// Mark packets from tailscale interface with Android system permission
++	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", androidSystemPermissionMark + "/" + androidSystemPermissionMark}
++	if err := i.ipt6.Append("mangle", "ts-prerouting", args...); err != nil {
++		return fmt.Errorf("adding %v in v6/mangle/ts-prerouting: %w", args, err)
++	}
++
+ 	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", subnetRouteMark + "/" + fwmarkMask}
+ 	if err := i.ipt6.Append("filter", "ts-forward", args...); err != nil {
+ 		return fmt.Errorf("adding %v in v6/filter/ts-forward: %w", args, err)
+@@ -385,6 +410,9 @@ func (i *iptablesRunner) DelChains() error {
+ 		if err := delChain(ipt, "filter", "ts-forward"); err != nil {
+ 			return err
+ 		}
++		if err := delChain(ipt, "mangle", "ts-prerouting"); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	for _, ipt := range i.getNATTables() {
+@@ -418,6 +446,9 @@ func (i *iptablesRunner) DelBase() error {
+ 		if err := del(ipt, "filter", "ts-forward"); err != nil {
+ 			return err
+ 		}
++		if err := del(ipt, "mangle", "ts-prerouting"); err != nil {
++			return err
++		}
+ 	}
+ 	for _, ipt := range i.getNATTables() {
+ 		if err := del(ipt, "nat", "ts-postrouting"); err != nil {
+@@ -438,6 +469,9 @@ func (i *iptablesRunner) DelHooks(logf logger.Logf) error {
+ 		if err := delTSHook(ipt, "filter", "FORWARD", logf); err != nil {
+ 			return err
+ 		}
++		if err := delTSHook(ipt, "mangle", "PREROUTING", logf); err != nil {
++			return err
++		}
+ 	}
+ 	for _, ipt := range i.getNATTables() {
+ 		if err := delTSHook(ipt, "nat", "POSTROUTING", logf); err != nil {
+diff --git a/util/osuser/group_ids.go b/util/osuser/group_ids.go
+index 4d43f2d..857edd2 100644
+--- a/util/osuser/group_ids.go
++++ b/util/osuser/group_ids.go
+@@ -23,6 +23,30 @@ func GetGroupIds(user *user.User) ([]string, error) {
+ 		return nil, nil
+ 	}
+ 
++	// We are hardcoding for shell user
++	if runtime.GOOS == "android" {
++		return []string{
++			"1002", // bluetooth
++			"1005", // audio
++			"1007", // log
++			"1013", // media
++			"1015", // sdcard_rw
++			"1024", // mtp
++			"1065", // reserved_disk
++			"1077", // external_storage
++			"1078", // ext_data_rw
++			"1079", // ext_data_obb
++			"3001", // net_bt_admin
++			"3002", // net_bt
++			"3003", // inet
++			"3007", // net_bt_acct
++			"3010", // wakelock
++			"3011", // uhid
++			"3013", // ???
++			"9997", // everybody
++		}, nil
++	}
++
+ 	if runtime.GOOS != "linux" && runtime.GOOS != "freebsd" {
+ 		return user.GroupIds()
+ 	}
+diff --git a/util/osuser/user.go b/util/osuser/user.go
+index fccaae4..0bfc1c0 100644
+--- a/util/osuser/user.go
++++ b/util/osuser/user.go
+@@ -111,6 +111,16 @@ func lookup(usernameOrUID string, std lookupStd, wantShell bool) (*user.User, st
+ 		}, "/bin/rc", nil
+ 	}
+ 
++	if runtime.GOOS == "android" {
++		return &user.User{
++			Uid:      "2000",
++			Gid:      "2000",
++			Username: "shell",
++			Name:     "shell",
++			HomeDir:  "/",
++		}, "/system/bin/sh", nil
++	}
++
+ 	// Start with getent if caller wants to get the user shell.
+ 	if wantShell {
+ 		return userLookupGetent(usernameOrUID, std)
+diff --git a/util/syspolicy/source/json_policy_store_hujson.go b/util/syspolicy/source/json_policy_store_hujson.go
+index 8f1e981..e67f277 100644
+--- a/util/syspolicy/source/json_policy_store_hujson.go
++++ b/util/syspolicy/source/json_policy_store_hujson.go
+@@ -1,15 +1,15 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !ios && !android && !ts_omit_hujsonconf
++//go:build !ios && !ts_omit_hujsonconf
+ 
+ package source
+ 
+ import "github.com/tailscale/hujson"
+ 
+ // Only link the hujson package on platforms that use it, to reduce binary
+-// size & memory a bit. iOS and Android don't load syspolicy files from
+-// disk so they don't need HuJSON either.
++// size & memory a bit. iOS doesn't load syspolicy files from disk.
++// The AOSP daemon uses file-based policy just like Linux.
+ //
+ // While the linker's deadcode mostly handles this today, this keeps us
+ // honest for the future.
+diff --git a/wgengine/magicsock/magicsock.go b/wgengine/magicsock/magicsock.go
+index 71fa113..e4f1348 100644
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -396,7 +396,7 @@ type Conn struct {
+ 	// knob values during netmap updates so we can detect a control-plane
+ 	// transition and trigger a [Conn.Rebind] to re-evaluate the
+ 	// UDP_GRO/UDP_SEGMENT socket options. Guarded by c.mu. Only consulted on
+-	// Linux; on other platforms tryEnableUDPOffload is a no-op so any
++	// Linux and AOSP; on other platforms tryEnableUDPOffload is a no-op so any
+ 	// transition is meaningless and no rebind is fired.
+ 	appliedDisableUDPGRO bool
+ 	appliedDisableUDPGSO bool
+@@ -644,12 +644,12 @@ func NewConn(opts Options) (*Conn, error) {
+ 	c.eventBus = opts.EventBus
+ 	c.port.Store(uint32(opts.Port))
+ 	c.controlKnobs = opts.ControlKnobs
+-	if runtime.GOOS == "linux" && c.controlKnobs != nil {
++	if (runtime.GOOS == "linux" || runtime.GOOS == "android") && c.controlKnobs != nil {
+ 		// Seed the cached "last applied" UDP offload knob values so the first
+ 		// netmap update doesn't spuriously trigger a rebind: bindSocket (called
+ 		// shortly after NewConn) will read these same knob values when
+ 		// configuring UDP_GRO/UDP_SEGMENT, so they're already in sync. We only
+-		// do this on Linux because tryEnableUDPOffload is a no-op elsewhere.
++		// do this on Linux and AOSP because tryEnableUDPOffload is a no-op elsewhere.
+ 		c.appliedDisableUDPGRO = c.controlKnobs.DisableUDPGRO.Load()
+ 		c.appliedDisableUDPGSO = c.controlKnobs.DisableUDPGSO.Load()
+ 	}
+@@ -3072,7 +3072,7 @@ func (c *Conn) setNetworkMapInternal(self tailcfg.NodeView, peers []tailcfg.Node
+ 		c.initializedAt = mono.Now() // the netmap is being reset
+ 	}
+ 	initializedAt := c.initializedAt
+-	if hasUDPTransport && runtime.GOOS == "linux" && c.controlKnobs != nil {
++	if hasUDPTransport && (runtime.GOOS == "linux" || runtime.GOOS == "android") && c.controlKnobs != nil {
+ 		curGRO = c.controlKnobs.DisableUDPGRO.Load()
+ 		curGSO = c.controlKnobs.DisableUDPGSO.Load()
+ 		if curGRO != c.appliedDisableUDPGRO || curGSO != c.appliedDisableUDPGSO {
+@@ -3507,7 +3507,7 @@ type connBind struct {
+ func (c *connBind) BatchSize() int {
+ 	// TODO(raggi): determine by properties rather than hardcoding platform behavior
+ 	switch runtime.GOOS {
+-	case "linux":
++	case "linux", "android":
+ 		return conn.IdealBatchSize
+ 	default:
+ 		return 1
+diff --git a/wgengine/router/osrouter/router_linux.go b/wgengine/router/osrouter/router_linux.go
+index c8b31d0..bce066c 100644
+--- a/wgengine/router/osrouter/router_linux.go
++++ b/wgengine/router/osrouter/router_linux.go
+@@ -1,8 +1,6 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !android
+-
+ package osrouter
+ 
+ import (
+@@ -16,6 +14,7 @@
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++	"runtime"
+ 	"slices"
+ 	"strconv"
+ 	"strings"
+@@ -1591,6 +1590,28 @@ func mustRouteTable(num int) RouteTable {
+ // and 'ip rule' implementations (including busybox), don't support
+ // checking for the lack of a fwmark, only the presence. The technique
+ // below works even on very old kernels.
++//
++// NOTE(kxxt): This doesn't work well with Android. In Android, we have
++//
++// 	    0:      from all lookup local
++// 	*   5210:   from all fwmark 0x80000/0xff0000 lookup main
++// 	*   5230:   from all fwmark 0x80000/0xff0000 lookup default
++// 	*   5250:   from all fwmark 0x80000/0xff0000 unreachable
++// 	*   5270:   from all lookup 52
++// 	    10000:  from all fwmark 0xc0000/0xd0000 lookup legacy_system
++// 	    11000:  from all iif lo oif dummy0 uidrange 0-0 lookup dummy0
++// 	    11000:  from all iif lo oif rmnet_data0 uidrange 0-0 lookup rmnet_data0
++// 	    16000:  from all fwmark 0x10063/0x1ffff iif lo lookup local_network
++// 	    16000:  from all fwmark 0xd0001/0xdffff iif lo lookup rmnet_data0
++// 	    17000:  from all iif lo oif dummy0 lookup dummy0
++// 	    17000:  from all fwmark 0xc0000/0xc0000 iif lo oif rmnet_data0 lookup rmnet_data0
++// 	    18000:  from all fwmark 0x0/0x10000 lookup legacy_system
++// 	    19000:  from all fwmark 0x0/0x10000 lookup legacy_network
++// 	    20000:  from all fwmark 0x0/0x10000 lookup local_network
++// 	    32000:  from all unreachable
++//
++// That directly skipped all android networking rules for packets matching 0x80000/0xff0000
++
+ var baseIPRules = []netlink.Rule{
+ 	// Packets from us, tagged with our fwmark, first try the kernel's
+ 	// main routing table.
+@@ -1627,6 +1648,16 @@ func mustRouteTable(num int) RouteTable {
+ 	// usual rules (pref 32766 and 32767, ie. main and default).
+ }
+ 
++var androidIPRules = []netlink.Rule{
++	// Packets from us, not tagged with our fwmark
++	{
++		Priority: 70,
++		Invert:   true,
++		Mark:     tsconst.LinuxBypassMarkNum,
++		Table:    tailscaleRouteTable.Num,
++	},
++}
++
+ // ubntIPRules are the policy routing rules that Tailscale uses, when running
+ // on a UBNT device.
+ //
+@@ -1651,6 +1682,8 @@ func mustRouteTable(num int) RouteTable {
+ func ipRules() []netlink.Rule {
+ 	if getDistroFunc() == distro.UBNT {
+ 		return ubntIPRules
++	} else if runtime.GOOS == "android" {
++		return androidIPRules
+ 	}
+ 	return baseIPRules
+ }
+diff --git a/wgengine/userspace.go b/wgengine/userspace.go
+index cc45fd4..5125a59 100644
+--- a/wgengine/userspace.go
++++ b/wgengine/userspace.go
+@@ -351,7 +351,8 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 	closePool.add(tsTUNDev)
+ 
+ 	rtr := conf.Router
+-	if version.IsMobile() {
++	// Treating Android as Linux
++	if version.IsMobile() && runtime.GOOS != "android" {
+ 		// Android and iOS don't handle large numbers of routes well, so we
+ 		// wrap the Router with one that consolidates routes down to the
+ 		// smallest number possible.
+@@ -564,11 +565,11 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 		return nil, fmt.Errorf("router.Up: %w", err)
+ 	}
+ 	tsTUNDev.SetLinkFeaturesPostUp(e.controlKnobs)
+-	if buildfeatures.HasGRO && runtime.GOOS == "linux" && e.controlKnobs != nil {
++	if buildfeatures.HasGRO && (runtime.GOOS == "linux" || runtime.GOOS == "android") && e.controlKnobs != nil {
+ 		// Seed the cached "last applied" TUN GRO knob values so the first
+ 		// netmap update doesn't spuriously call ApplyGROKnobs:
+ 		// SetLinkFeaturesPostUp above already applied these same values. We
+-		// only do this on Linux because ApplyGROKnobs is a no-op elsewhere.
++		// only do this on Linux and AOSP because ApplyGROKnobs is a no-op elsewhere.
+ 		e.lastAppliedDisableTUNUDPGRO = e.controlKnobs.DisableTUNUDPGRO.Load()
+ 		e.lastAppliedDisableTUNTCPGRO = e.controlKnobs.DisableTUNTCPGRO.Load()
+ 	}
+@@ -1229,7 +1230,7 @@ func (e *userspaceEngine) SetSelfNode(self tailcfg.NodeView) {
+ 	e.selfNode = self
+ 	tunGROKnobsChanged := false
+ 	var curUDP, curTCP bool
+-	if buildfeatures.HasGRO && runtime.GOOS == "linux" && e.controlKnobs != nil {
++	if buildfeatures.HasGRO && (runtime.GOOS == "linux" || runtime.GOOS == "android") && e.controlKnobs != nil {
+ 		curUDP = e.controlKnobs.DisableTUNUDPGRO.Load()
+ 		curTCP = e.controlKnobs.DisableTUNTCPGRO.Load()
+ 		// Only act on transitions toward "disabled"; wireguard-go's GRO

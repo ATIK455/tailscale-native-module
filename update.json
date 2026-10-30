@@ -1,0 +1,6 @@
+{
+  "version": "v1.104.4",
+  "versionCode": 11044,
+  "zipUrl": "https://github.com/ATIK455/tailscale-native-module/releases/download/v1.104.4/tailscale-native.zip",
+  "changelog": "https://raw.githubusercontent.com/ATIK455/tailscale-native-module/main/changelog.md"
+}
