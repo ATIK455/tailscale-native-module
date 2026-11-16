@@ -1,7 +1,7 @@
 id=native_tailscale
 name=Native Tailscale TUN
-version=v1.104.5
-versionCode=11045
+version=v1.104.7
+versionCode=11047
 author=Iridule & ATIK455
 description=Root-native Android Tailscale using official Tailscale with native TUN routing. Tap Action in Magisk/KernelSU to update upstream binaries.
 updateJson=https://raw.githubusercontent.com/ATIK455/tailscale-native-module/main/update.json
